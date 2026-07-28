@@ -1,42 +1,46 @@
-# Build context is the project root (see docker-compose.yml) — this
-# Dockerfile needs access to both frontend/ and gateway/.
+# Sports Store gateway - the single entrypoint for the whole application.
 #
-# This image has two stages:
-#   1. Build the React frontend into static files.
-#   2. Serve those static files with NGINX, and proxy /api/* to the
-#      backend services.
+# Two stages: build the React bundle, then serve the static output with NGINX
+# and reverse-proxy /api/* to the backend services.
+#
+# The frontend lives in its own repository, so this build needs a second
+# source tree. Compose supplies it as a NAMED BUILD CONTEXT called `frontend`
+# (see sports-store-local/docker-compose.yml). That keeps this Dockerfile
+# referencing the frontend repo's own paths instead of hard-coding a
+# "../sibling-directory" layout that only works on a developer's laptop.
+#
+# In CI each repo builds on its own, with no sibling checkout at all. There
+# the frontend repo publishes its build output as its own image to ECR and
+# the copy below becomes `COPY --from=<frontend-image> /dist ./`. Same
+# mechanism, different source - which is why the named context is worth
+# using now rather than a relative path.
 
 # ---------------------------------------------------------------------
-# Stage 1: build the frontend
+# Stage 1: build the React frontend
 # ---------------------------------------------------------------------
-# TODO: FROM a Node LTS image (e.g. node:20-alpine), and name this stage
-#   so the next stage can copy from it (`AS frontend-build`).
+FROM node:20-alpine AS frontend-build
 
-# TODO: set a working directory.
+WORKDIR /build
 
-# TODO: install dependencies.
-#   - Copy frontend/package.json and frontend/package-lock.json first,
-#     then run `npm ci` (not `npm install` — ci uses the lockfile exactly
-#     and is meant for reproducible, automated builds).
-#   - Copying only the manifest files first keeps this layer cached
-#     separately from application source changes.
+# Manifests first, so the slow dependency layer stays cached when only
+# application source changes. `npm ci` - not `npm install` - installs exactly
+# what the lockfile pins, which is what a reproducible build needs.
+COPY --from=frontend package.json package-lock.json ./
+RUN npm ci
 
-# TODO: copy the rest of frontend/ and run the production build
-#   (`npm run build`). The build output goes to frontend/dist.
+COPY --from=frontend . .
+RUN npm run build
 
 # ---------------------------------------------------------------------
 # Stage 2: serve with NGINX
 # ---------------------------------------------------------------------
-# TODO: FROM an nginx image (e.g. nginx:1.27-alpine).
+FROM nginx:1.27-alpine
 
-# TODO: copy gateway/nginx.conf into the image at
-#   /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY proxy_params.conf /etc/nginx/proxy_params.conf
 
-# TODO: copy gateway/proxy_params.conf into the image at
-#   /etc/nginx/proxy_params.conf
+# Only the built assets cross over from stage 1 - Node, node_modules and the
+# frontend sources never reach the final image.
+COPY --from=frontend-build /build/dist /usr/share/nginx/html
 
-# TODO: copy the built frontend from the frontend-build stage into
-#   /usr/share/nginx/html
-#   (use `COPY --from=frontend-build <src> <dest>`)
-
-# TODO: document the port NGINX listens on (80).
+EXPOSE 80
