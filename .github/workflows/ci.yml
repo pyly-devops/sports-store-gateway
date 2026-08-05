@@ -55,12 +55,28 @@ jobs:
           echo "tag=$tag"        >> "$GITHUB_OUTPUT"
           echo "sha=${tag##*-}"  >> "$GITHUB_OUTPUT"   # 0.1.0-fd06de1 -> fd06de1
 
-      # Public repo, no token. The commit is named by the pin, so this builds
-      # the same bytes the ECR image holds - not "whatever main is today".
+      # actions/checkout only recognises a `ref:` as a commit fetch when it is
+      # the full 40-character SHA - a short SHA is treated as a branch/tag name
+      # glob instead, which does not exist, so the fetch fails outright rather
+      # than falling back to a full-history fetch. Resolving it first through
+      # the REST API (GITHUB_TOKEN only raises the rate limit here; the repo
+      # itself is public) is what makes the pin actually work.
+      - name: Resolve the pinned commit to a full SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          full=$(gh api repos/pyly-devops/sports-store-frontend/commits/${{ steps.pin.outputs.sha }} --jq .sha)
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+
+      # Public repo, no token needed for the checkout itself. The commit is
+      # named by the pin, so this builds the same bytes the ECR image holds -
+      # not "whatever main is today".
       - uses: actions/checkout@v4
         with:
           repository: pyly-devops/sports-store-frontend
-          ref: ${{ steps.pin.outputs.sha }}
+          ref: ${{ steps.resolve.outputs.full }}
           path: .frontend
 
       - run: docker build --platform linux/amd64 -t frontend-pr:local .frontend
