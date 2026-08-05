@@ -1,0 +1,119 @@
+# Milestone 7. Fires on a repository_dispatch from sports-store-frontend's
+# publish job — replaces the human step of copying a tag into
+# FRONTEND_IMAGE_TAG and opening a PR.
+#
+# repository_dispatch only ever runs the workflow file that's on the
+# TARGET repo's DEFAULT BRANCH, regardless of what triggered it. This file
+# must be merged to `main` here before the frontend ever dispatches, or the
+# event fires into nothing with no error anywhere — there's no failed run to
+# look at, because no run starts.
+#
+# client_payload is attacker-shaped input: it comes from another repo's
+# workflow, which could itself be compromised, or the dispatch API could be
+# called directly by anyone holding a token for this App's installation.
+# Two rules, both followed below:
+#   1. Never let it reach a `run:` body through ${{ }} interpolation — that
+#      is a shell-injection primitive on a runner holding a git-write token.
+#      It goes through `env:` only, so the shell sees a variable, never a
+#      literal spliced into the command line.
+#   2. Validate its shape before trusting it for anything: regex-check
+#      against <semver>-<7 hex>, then confirm the commit actually exists
+#      upstream via the GitHub API rather than trusting the string alone.
+
+name: frontend-bump
+
+on:
+  repository_dispatch:
+    types: [frontend-image]
+
+permissions: {} # GITHUB_TOKEN cannot write to another repo at any level, so granting it anything here is theatre.
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.client_payload.tag }}
+    steps:
+      - name: Validate the tag shape
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{7}$ ]]; then
+            echo "::error::client_payload.tag '$TAG' does not match <semver>-<7hex>" >&2
+            exit 1
+          fi
+
+      - name: Confirm the commit exists upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="${TAG##*-}"
+          gh api "repos/pyly-devops/sports-store-frontend/commits/${sha}" >/dev/null || {
+            echo "::error::commit $sha does not exist in sports-store-frontend" >&2
+            exit 1
+          }
+
+      # Mints a token scoped to this App's installation on THIS repo only —
+      # the bump-deployment flow's token (scoped to sports-store-deployments)
+      # is a completely separate mint, on a completely separate repo.
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.DEPLOY_BOT_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_BOT_PRIVATE_KEY }}
+          owner: pyly-devops
+          repositories: sports-store-gateway
+
+      # A stable branch name, no tag in it: bump/frontend-image means "the
+      # pending bump", of which there is exactly one. A superseded bump
+      # replaces the open PR instead of queuing behind an abandoned one.
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Move onto bump/frontend-image, merging main in
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin bump/frontend-image >/dev/null; then
+            git checkout -B bump/frontend-image origin/bump/frontend-image
+            git merge --no-edit origin/main || {
+              echo "::error::merge conflict against main — needs a human" >&2
+              exit 1
+            }
+          else
+            git checkout -B bump/frontend-image
+          fi
+
+      - name: Write the tag
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAG" > FRONTEND_IMAGE_TAG
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "no change — tag already at $TAG"
+            exit 0
+          fi
+          git config user.name "cloudcart-deploy-argocd-bot[bot]"
+          git config user.email "cloudcart-deploy-argocd-bot[bot]@users.noreply.github.com"
+          git add FRONTEND_IMAGE_TAG
+          git commit -m "Bump frontend to ${TAG}"
+          git push origin HEAD:bump/frontend-image
+
+      - name: Open or update the PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          body="Bumps the pinned frontend build to \`${TAG}\`. \`verify\` rebuilds this exact commit from source — a green check here is a real content change, not just a version-string edit."
+          if gh pr view bump/frontend-image --repo pyly-devops/sports-store-gateway >/dev/null 2>&1; then
+            gh pr edit bump/frontend-image --repo pyly-devops/sports-store-gateway --body "$body"
+          else
+            gh pr create --repo pyly-devops/sports-store-gateway \
+              --head bump/frontend-image --base main \
+              --title "Bump frontend to ${TAG}" \
+              --body "$body"
+          fi
