@@ -12,3 +12,11 @@
 .dockerignore
 Dockerfile
 README.md
+
+# The PR job's only build-context source of AWS is none at all, so it
+# rebuilds the pinned frontend from source into ./.frontend (Milestone 6
+# plan §4e). actions/checkout can only write inside the workspace, which puts
+# that checkout inside THIS repo's own build context. Without this line,
+# every gateway build in CI ships the entire frontend source tree into the
+# build context, and a future COPY could silently include it.
+.frontend/
