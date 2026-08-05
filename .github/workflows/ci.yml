@@ -1,0 +1,176 @@
+# CI for the gateway (Milestone 6).
+#
+# Two jobs, and the split between them is the security boundary:
+#
+#   verify   runs on every pull request AND on every push to main. It holds
+#            `contents: read` and nothing else, so it cannot even ask for an
+#            OIDC token, let alone reach AWS.
+#   publish  runs only on main, only after verify passed, and is the only job
+#            in this repo that requests `id-token: write`.
+#
+# What actually stops a pull request from publishing is not the `if:` below -
+# it is the trust policy on github-actions-sports-store-gateway-ecr-push,
+# whose sub condition is
+# `repo:pyly-devops/sports-store-gateway:ref:refs/heads/main`. A PR run's
+# token carries `...:pull_request`, which never matches, so the AssumeRole
+# call fails outright. The `if:` makes that visible in the file; it is not
+# what makes it true.
+#
+# The gateway is the one repo whose Dockerfile starts `FROM ${FRONTEND_IMAGE}`
+# - a pull from a sibling repo's ECR image. On a PR there is no AWS identity
+# at all, so that pull cannot happen. FRONTEND_IMAGE_TAG names the exact
+# frontend commit the gateway is built against; because every repo in the org
+# is public, `verify` rebuilds that same commit from source with no token,
+# instead of skipping the image build or weakening the OIDC trust to buy a PR
+# a read-only ECR role.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded PR runs; never cancel a main run. A cancelled main run is a
+# commit with no image in ECR, and because the next merge produces a different
+# hash, nothing ever retroactively builds it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned frontend build
+        id: pin
+        run: |
+          set -euo pipefail
+          tag=$(tr -d ' \n' < FRONTEND_IMAGE_TAG)
+          echo "tag=$tag"        >> "$GITHUB_OUTPUT"
+          echo "sha=${tag##*-}"  >> "$GITHUB_OUTPUT"   # 0.1.0-fd06de1 -> fd06de1
+
+      # Public repo, no token. The commit is named by the pin, so this builds
+      # the same bytes the ECR image holds - not "whatever main is today".
+      - uses: actions/checkout@v4
+        with:
+          repository: pyly-devops/sports-store-frontend
+          ref: ${{ steps.pin.outputs.sha }}
+          path: .frontend
+
+      - run: docker build --platform linux/amd64 -t frontend-pr:local .frontend
+
+      - run: |
+          docker build --platform linux/amd64 \
+            --build-arg FRONTEND_IMAGE=frontend-pr:local \
+            -t ci:${{ github.sha }} .
+
+      # nginx.conf is the whole point of this repo. NGINX resolves literal
+      # proxy_pass hostnames at config-load time, and the five Kubernetes
+      # Service names do not exist on a runner - mapping them to 127.0.0.1
+      # tests the config's syntax, not the runner's DNS.
+      - name: nginx.conf parses
+        run: |
+          docker run --rm \
+            --add-host auth-service:127.0.0.1 \
+            --add-host catalog-service:127.0.0.1 \
+            --add-host cart-service:127.0.0.1 \
+            --add-host order-service:127.0.0.1 \
+            --add-host payment-service:127.0.0.1 \
+            ci:${{ github.sha }} nginx -t
+
+      - name: The bundle landed where NGINX serves from
+        run: docker run --rm ci:${{ github.sha }} ls /usr/share/nginx/html/index.html
+
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Matches var.app_components in sports-store-infrastructure.
+      ECR_REPOSITORY: sports-store/gateway
+    steps:
+      - uses: actions/checkout@v4
+
+      # No static AWS keys, ever (CLAUDE.md). vars.AWS_ACCOUNT_ID is a GitHub
+      # Actions ORGANISATION variable, not a secret: an account id
+      # authenticates as nothing and is already in git in the deployments
+      # repo. It lives in one place so a new account is one edit rather than
+      # seven PRs. The role name is written out because a reviewer should be
+      # able to see what this file publishes as without opening settings.
+      #
+      # This role also needs ecr:BatchGetImage / GetDownloadUrlForLayer /
+      # BatchCheckLayerAvailability on sports-store/frontend to pull the base
+      # image below - the one documented exception to "every push role is
+      # scoped to its own repository only". See
+      # sports-store-infrastructure/envs/prod/github-oidc.tf,
+      # gateway_frontend_pull.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-sports-store-gateway-ecr-push
+          aws-region: us-east-1 # matches envs/prod/variables.tf
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Compute the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          version=$(tr -d ' \n' < VERSION)
+          case "$version" in
+            latest|"") echo "::error::VERSION must not be '$version'"; exit 1 ;;
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::VERSION is not semver: '$version'"; exit 1 ;;
+          esac
+          # git's own answer, not ${GITHUB_SHA:0:7}. The workspace Makefile
+          # uses --short=7 too, so the two can never disagree about a commit
+          # even on the day git needs eight characters to disambiguate.
+          echo "tag=$version-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/$ECR_REPOSITORY:$TAG"
+
+          # Unlike the PR job, this pulls the pinned frontend straight from
+          # ECR rather than rebuilding it from source - the published image
+          # must be the exact artifact the frontend's own pipeline built,
+          # tagged and pushed, not a second build of the same commit.
+          frontend="$REGISTRY/sports-store/frontend:$(tr -d ' \n' < FRONTEND_IMAGE_TAG)"
+
+          # Plain docker build + push, NOT docker/build-push-action: buildx
+          # pushes an image index carrying provenance attestations, which show
+          # up in the ECR console as a phantom unknown/unknown platform next to
+          # every image. If this ever moves to buildx for its cache backends,
+          # it needs `provenance: false`.
+          docker build --platform linux/amd64 \
+            --build-arg FRONTEND_IMAGE="$frontend" -t "$image" .
+
+          # ECR repositories are IMMUTABLE (Milestone 4). Re-running this
+          # workflow on the same commit would otherwise die on a tag that
+          # already exists - the least useful red X there is. Same guard as the
+          # workspace Makefile's push_if_new.
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+               --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "already in ECR, tag not moved: $image"
+          else
+            docker push "$image"
+          fi
+
+          # Until Milestone 7 a human copies this into the deployments repo's
+          # environments/production/images/gateway.yaml. Putting it on the run
+          # summary is the difference between a 30-second manual deploy step
+          # and digging through a log for it.
+          echo "Pushed \`$TAG\` to \`$ECR_REPOSITORY\`" >> "$GITHUB_STEP_SUMMARY"
