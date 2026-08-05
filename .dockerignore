@@ -1,0 +1,14 @@
+# The build context here is tiny - two config files - so this is hygiene
+# rather than a correctness fix. It still earns its place: without it `.git/`
+# is uploaded to the daemon on every build and lands in the context hash, so
+# an unrelated commit invalidates the cache for a build whose real inputs
+# (nginx.conf, proxy_params.conf) have not changed.
+#
+# Note the frontend bundle is NOT in this context at all - it arrives as an
+# image through --build-arg FRONTEND_IMAGE. Nothing here needs to exclude it.
+
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+README.md
