@@ -109,7 +109,16 @@ jobs:
         run: |
           set -euo pipefail
           body="Bumps the pinned frontend build to \`${TAG}\`. \`verify\` rebuilds this exact commit from source — a green check here is a real content change, not just a version-string edit."
-          if gh pr view bump/frontend-image --repo pyly-devops/sports-store-gateway >/dev/null 2>&1; then
+          # `gh pr view` finds a PR by head branch regardless of state — a
+          # branch whose only-ever PR already merged still "exists" to a
+          # bare existence check, so this used to edit the OLD merged PR's
+          # body and leave the new commit on the branch with nothing open
+          # to land it. Found live (M8 Tier 4 verification, 2026-08-07),
+          # same bug as the deploy/<service> flows in ci.yml across every
+          # app repo. Checking state explicitly is the fix — anything but
+          # OPEN needs a new PR.
+          STATE=$(gh pr view bump/frontend-image --repo pyly-devops/sports-store-gateway --json state --jq .state 2>/dev/null || echo NONE)
+          if [ "$STATE" = "OPEN" ]; then
             gh pr edit bump/frontend-image --repo pyly-devops/sports-store-gateway --body "$body"
           else
             gh pr create --repo pyly-devops/sports-store-gateway \
